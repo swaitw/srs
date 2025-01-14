@@ -1,4 +1,6 @@
-/* 
+/* SPDX-License-Identifier: MPL-1.1 OR GPL-2.0-or-later */
+
+/*
  * The contents of this file are subject to the Mozilla Public
  * License Version 1.1 (the "License"); you may not use this file
  * except in compliance with the License. You may obtain a copy of
@@ -49,14 +51,31 @@
 
 // Global stat.
 #if defined(DEBUG) && defined(DEBUG_STATS)
-unsigned long long _st_stat_epoll = 0;
-unsigned long long _st_stat_epoll_zero = 0;
-unsigned long long _st_stat_epoll_shake = 0;
-unsigned long long _st_stat_epoll_spin = 0;
+__thread unsigned long long _st_stat_epoll = 0;
+__thread unsigned long long _st_stat_epoll_zero = 0;
+__thread unsigned long long _st_stat_epoll_shake = 0;
+__thread unsigned long long _st_stat_epoll_spin = 0;
 #endif
 
-#if !defined(MD_HAVE_KQUEUE) && !defined(MD_HAVE_EPOLL)
-    #error Only support epoll(for Linux) or kqueue(for Darwin)
+#if !defined(MD_HAVE_KQUEUE) && !defined(MD_HAVE_EPOLL) && !defined(MD_HAVE_SELECT)
+    #error Only support epoll(for Linux), kqueue(for Darwin) or select(for Cygwin)
+#endif
+
+
+#ifdef MD_HAVE_SELECT
+static struct _st_seldata {
+    fd_set fd_read_set, fd_write_set, fd_exception_set;
+    int fd_ref_cnts[FD_SETSIZE][3];
+    int maxfd;
+} *_st_select_data;
+
+#define _ST_SELECT_MAX_OSFD      (_st_select_data->maxfd)
+#define _ST_SELECT_READ_SET      (_st_select_data->fd_read_set)
+#define _ST_SELECT_WRITE_SET     (_st_select_data->fd_write_set)
+#define _ST_SELECT_EXCEP_SET     (_st_select_data->fd_exception_set)
+#define _ST_SELECT_READ_CNT(fd)  (_st_select_data->fd_ref_cnts[fd][0])
+#define _ST_SELECT_WRITE_CNT(fd) (_st_select_data->fd_ref_cnts[fd][1])
+#define _ST_SELECT_EXCEP_CNT(fd) (_st_select_data->fd_ref_cnts[fd][2])
 #endif
 
 
@@ -67,7 +86,7 @@ typedef struct _kq_fd_data {
     int revents;
 } _kq_fd_data_t;
 
-static struct _st_kqdata {
+static __thread struct _st_kqdata {
     _kq_fd_data_t *fd_data;
     struct kevent *evtlist;
     struct kevent *addlist;
@@ -79,6 +98,7 @@ static struct _st_kqdata {
     int dellist_size;
     int dellist_cnt;
     int kq;
+    pid_t pid;
 } *_st_kq_data;
 
 #ifndef ST_KQ_MIN_EVTLIST_SIZE
@@ -99,7 +119,7 @@ typedef struct _epoll_fd_data {
     int revents;
 } _epoll_fd_data_t;
 
-static struct _st_epolldata {
+static __thread struct _st_epolldata {
     _epoll_fd_data_t *fd_data;
     struct epoll_event *evtlist;
     int fd_data_size;
@@ -127,7 +147,307 @@ static struct _st_epolldata {
 
 #endif  /* MD_HAVE_EPOLL */
 
-_st_eventsys_t *_st_eventsys = NULL;
+__thread _st_eventsys_t *_st_eventsys = NULL;
+
+
+#ifdef MD_HAVE_SELECT
+/*****************************************
+ * select event system
+ */
+
+ST_HIDDEN int _st_select_init(void)
+{
+    _st_select_data = (struct _st_seldata *) malloc(sizeof(*_st_select_data));
+    if (!_st_select_data)
+        return -1;
+
+    memset(_st_select_data, 0, sizeof(*_st_select_data));
+    _st_select_data->maxfd = -1;
+
+    return 0;
+}
+
+ST_HIDDEN int _st_select_pollset_add(struct pollfd *pds, int npds)
+{
+    struct pollfd *pd;
+    struct pollfd *epd = pds + npds;
+
+    /* Do checks up front */
+    for (pd = pds; pd < epd; pd++) {
+        if (pd->fd < 0 || pd->fd >= FD_SETSIZE || !pd->events ||
+            (pd->events & ~(POLLIN | POLLOUT | POLLPRI))) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+    for (pd = pds; pd < epd; pd++) {
+        if (pd->events & POLLIN) {
+            FD_SET(pd->fd, &_ST_SELECT_READ_SET);
+            _ST_SELECT_READ_CNT(pd->fd)++;
+        }
+        if (pd->events & POLLOUT) {
+            FD_SET(pd->fd, &_ST_SELECT_WRITE_SET);
+            _ST_SELECT_WRITE_CNT(pd->fd)++;
+        }
+        if (pd->events & POLLPRI) {
+            FD_SET(pd->fd, &_ST_SELECT_EXCEP_SET);
+            _ST_SELECT_EXCEP_CNT(pd->fd)++;
+        }
+        if (_ST_SELECT_MAX_OSFD < pd->fd)
+            _ST_SELECT_MAX_OSFD = pd->fd;
+    }
+
+    return 0;
+}
+
+ST_HIDDEN void _st_select_pollset_del(struct pollfd *pds, int npds)
+{
+    struct pollfd *pd;
+    struct pollfd *epd = pds + npds;
+
+    for (pd = pds; pd < epd; pd++) {
+        if (pd->events & POLLIN) {
+            if (--_ST_SELECT_READ_CNT(pd->fd) == 0)
+                FD_CLR(pd->fd, &_ST_SELECT_READ_SET);
+        }
+        if (pd->events & POLLOUT) {
+            if (--_ST_SELECT_WRITE_CNT(pd->fd) == 0)
+                FD_CLR(pd->fd, &_ST_SELECT_WRITE_SET);
+        }
+        if (pd->events & POLLPRI) {
+            if (--_ST_SELECT_EXCEP_CNT(pd->fd) == 0)
+                FD_CLR(pd->fd, &_ST_SELECT_EXCEP_SET);
+        }
+    }
+}
+
+ST_HIDDEN void _st_select_find_bad_fd(void)
+{
+    _st_clist_t *q;
+    _st_pollq_t *pq;
+    int notify;
+    struct pollfd *pds, *epds;
+    int pq_max_osfd, osfd;
+    short events;
+
+    _ST_SELECT_MAX_OSFD = -1;
+
+    for (q = _st_this_vp.io_q.next; q != &_st_this_vp.io_q; q = q->next) {
+        pq = _ST_POLLQUEUE_PTR(q);
+        notify = 0;
+        epds = pq->pds + pq->npds;
+        pq_max_osfd = -1;
+
+        for (pds = pq->pds; pds < epds; pds++) {
+            osfd = pds->fd;
+            pds->revents = 0;
+            if (pds->events == 0)
+                continue;
+            if (fcntl(osfd, F_GETFL, 0) < 0) {
+                pds->revents = POLLNVAL;
+                notify = 1;
+            }
+            if (osfd > pq_max_osfd) {
+                pq_max_osfd = osfd;
+            }
+        }
+
+        if (notify) {
+            st_clist_remove(&pq->links);
+            pq->on_ioq = 0;
+            /*
+             * Decrement the count of descriptors for each descriptor/event
+             * because this I/O request is being removed from the ioq
+             */
+            for (pds = pq->pds; pds < epds; pds++) {
+                osfd = pds->fd;
+                events = pds->events;
+                if (events & POLLIN) {
+                    if (--_ST_SELECT_READ_CNT(osfd) == 0) {
+                        FD_CLR(osfd, &_ST_SELECT_READ_SET);
+                    }
+                }
+                if (events & POLLOUT) {
+                    if (--_ST_SELECT_WRITE_CNT(osfd) == 0) {
+                        FD_CLR(osfd, &_ST_SELECT_WRITE_SET);
+                    }
+                }
+                if (events & POLLPRI) {
+                    if (--_ST_SELECT_EXCEP_CNT(osfd) == 0) {
+                        FD_CLR(osfd, &_ST_SELECT_EXCEP_SET);
+                    }
+                }
+            }
+
+            if (pq->thread->flags & _ST_FL_ON_SLEEPQ)
+                _st_del_sleep_q(pq->thread);
+            pq->thread->state = _ST_ST_RUNNABLE;
+            st_clist_insert_before(&pq->thread->links, &_st_this_vp.run_q);
+        } else {
+            if (_ST_SELECT_MAX_OSFD < pq_max_osfd)
+                _ST_SELECT_MAX_OSFD = pq_max_osfd;
+        }
+    }
+}
+
+ST_HIDDEN void _st_select_dispatch(void)
+{
+    struct timeval timeout, *tvp;
+    fd_set r, w, e;
+    fd_set *rp, *wp, *ep;
+    int nfd, pq_max_osfd, osfd;
+    _st_clist_t *q;
+    st_utime_t min_timeout;
+    _st_pollq_t *pq;
+    int notify;
+    struct pollfd *pds, *epds;
+    short events, revents;
+
+    /*
+     * Assignment of fd_sets
+     */
+    r = _ST_SELECT_READ_SET;
+    w = _ST_SELECT_WRITE_SET;
+    e = _ST_SELECT_EXCEP_SET;
+
+    rp = &r;
+    wp = &w;
+    ep = &e;
+
+    if (_st_this_vp.sleep_q == NULL) {
+        tvp = NULL;
+    } else {
+        min_timeout = (_st_this_vp.sleep_q->due <= _st_this_vp.last_clock) ? 0 :
+                      (_st_this_vp.sleep_q->due - _st_this_vp.last_clock);
+        timeout.tv_sec  = (int) (min_timeout / 1000000);
+        timeout.tv_usec = (int) (min_timeout % 1000000);
+        tvp = &timeout;
+    }
+
+    /* Check for I/O operations */
+    nfd = select(_ST_SELECT_MAX_OSFD + 1, rp, wp, ep, tvp);
+
+    /* Notify threads that are associated with the selected descriptors */
+    if (nfd > 0) {
+        _ST_SELECT_MAX_OSFD = -1;
+        for (q = _st_this_vp.io_q.next; q != &_st_this_vp.io_q; q = q->next) {
+            pq = _ST_POLLQUEUE_PTR(q);
+            notify = 0;
+            epds = pq->pds + pq->npds;
+            pq_max_osfd = -1;
+
+            for (pds = pq->pds; pds < epds; pds++) {
+                osfd = pds->fd;
+                events = pds->events;
+                revents = 0;
+                if ((events & POLLIN) && FD_ISSET(osfd, rp)) {
+                    revents |= POLLIN;
+                }
+                if ((events & POLLOUT) && FD_ISSET(osfd, wp)) {
+                    revents |= POLLOUT;
+                }
+                if ((events & POLLPRI) && FD_ISSET(osfd, ep)) {
+                    revents |= POLLPRI;
+                }
+                pds->revents = revents;
+                if (revents) {
+                    notify = 1;
+                }
+                if (osfd > pq_max_osfd) {
+                    pq_max_osfd = osfd;
+                }
+            }
+            if (notify) {
+                st_clist_remove(&pq->links);
+                pq->on_ioq = 0;
+                /*
+                 * Decrement the count of descriptors for each descriptor/event
+                 * because this I/O request is being removed from the ioq
+                 */
+                for (pds = pq->pds; pds < epds; pds++) {
+                    osfd = pds->fd;
+                    events = pds->events;
+                    if (events & POLLIN) {
+                        if (--_ST_SELECT_READ_CNT(osfd) == 0) {
+                            FD_CLR(osfd, &_ST_SELECT_READ_SET);
+                        }
+                    }
+                    if (events & POLLOUT) {
+                        if (--_ST_SELECT_WRITE_CNT(osfd) == 0) {
+                            FD_CLR(osfd, &_ST_SELECT_WRITE_SET);
+                        }
+                    }
+                    if (events & POLLPRI) {
+                        if (--_ST_SELECT_EXCEP_CNT(osfd) == 0) {
+                            FD_CLR(osfd, &_ST_SELECT_EXCEP_SET);
+                        }
+                    }
+                }
+
+                if (pq->thread->flags & _ST_FL_ON_SLEEPQ)
+                    _st_del_sleep_q(pq->thread);
+                pq->thread->state = _ST_ST_RUNNABLE;
+                st_clist_insert_before(&pq->thread->links, &_st_this_vp.run_q);
+            } else {
+                if (_ST_SELECT_MAX_OSFD < pq_max_osfd)
+                    _ST_SELECT_MAX_OSFD = pq_max_osfd;
+            }
+        }
+    } else if (nfd < 0) {
+        /*
+         * It can happen when a thread closes file descriptor
+         * that is being used by some other thread -- BAD!
+         */
+        if (errno == EBADF)
+            _st_select_find_bad_fd();
+    }
+}
+
+ST_HIDDEN int _st_select_fd_new(int osfd)
+{
+    if (osfd >= FD_SETSIZE) {
+        errno = EMFILE;
+        return -1;
+    }
+
+    return 0;
+}
+
+ST_HIDDEN int _st_select_fd_close(int osfd)
+{
+    if (_ST_SELECT_READ_CNT(osfd) || _ST_SELECT_WRITE_CNT(osfd) ||
+        _ST_SELECT_EXCEP_CNT(osfd)) {
+        errno = EBUSY;
+        return -1;
+    }
+
+    return 0;
+}
+
+ST_HIDDEN int _st_select_fd_getlimit(void)
+{
+    return FD_SETSIZE;
+}
+
+ST_HIDDEN void _st_select_destroy(void)
+{
+    /* TODO: FIXME: Implements it */
+}
+
+static _st_eventsys_t _st_select_eventsys = {
+        "select",
+        ST_EVENTSYS_SELECT,
+        _st_select_init,
+        _st_select_dispatch,
+        _st_select_pollset_add,
+        _st_select_pollset_del,
+        _st_select_fd_new,
+        _st_select_fd_close,
+        _st_select_fd_getlimit,
+        _st_select_destroy
+};
+#endif
 
 
 #ifdef MD_HAVE_KQUEUE
@@ -150,6 +470,7 @@ ST_HIDDEN int _st_kq_init(void)
         goto cleanup_kq;
     }
     fcntl(_st_kq_data->kq, F_SETFD, FD_CLOEXEC);
+    _st_kq_data->pid = getpid();
 
     /*
      * Allocate file descriptor data array.
@@ -376,15 +697,16 @@ ST_HIDDEN void _st_kq_dispatch(void)
     int nfd, i, osfd, notify, filter;
     short events, revents;
 
-    if (_ST_SLEEPQ == NULL) {
+    if (_st_this_vp.sleep_q == NULL) {
         tsp = NULL;
     } else {
-        min_timeout = (_ST_SLEEPQ->due <= _ST_LAST_CLOCK) ? 0 : (_ST_SLEEPQ->due - _ST_LAST_CLOCK);
+        min_timeout = (_st_this_vp.sleep_q->due <= _st_this_vp.last_clock) ? 0 : (_st_this_vp.sleep_q->due - _st_this_vp.last_clock);
         timeout.tv_sec  = (time_t) (min_timeout / 1000000);
         timeout.tv_nsec = (long) ((min_timeout % 1000000) * 1000);
         tsp = &timeout;
     }
 
+ retry_kevent:
     /* Check for I/O operations */
     nfd = kevent(_st_kq_data->kq,
                  _st_kq_data->addlist, _st_kq_data->addlist_cnt,
@@ -413,7 +735,7 @@ ST_HIDDEN void _st_kq_dispatch(void)
 
         _st_kq_data->dellist_cnt = 0;
 
-        for (q = _ST_IOQ.next; q != &_ST_IOQ; q = q->next) {
+        for (q = _st_this_vp.io_q.next; q != &_st_this_vp.io_q; q = q->next) {
             pq = _ST_POLLQUEUE_PTR(q);
             notify = 0;
             epds = pq->pds + pq->npds;
@@ -434,7 +756,7 @@ ST_HIDDEN void _st_kq_dispatch(void)
                 }
             }
             if (notify) {
-                ST_REMOVE_LINK(&pq->links);
+                st_clist_remove(&pq->links);
                 pq->on_ioq = 0;
                 for (pds = pq->pds; pds < epds; pds++) {
                     osfd = pds->fd;
@@ -460,9 +782,9 @@ ST_HIDDEN void _st_kq_dispatch(void)
                 }
 
                 if (pq->thread->flags & _ST_FL_ON_SLEEPQ)
-                    _ST_DEL_SLEEPQ(pq->thread);
+                    _st_del_sleep_q(pq->thread);
                 pq->thread->state = _ST_ST_RUNNABLE;
-                _ST_ADD_RUNQ(pq->thread);
+                st_clist_insert_before(&pq->thread->links, &_st_this_vp.run_q);
             }
         }
 
@@ -477,6 +799,23 @@ ST_HIDDEN void _st_kq_dispatch(void)
         for (i = 0; i < nfd; i++) {
             osfd = _st_kq_data->evtlist[i].ident;
             _ST_KQ_REVENTS(osfd) = 0;
+        }
+    } else if (nfd < 0) {
+        if (errno == EBADF && _st_kq_data->pid != getpid()) {
+            /* We probably forked, reinitialize kqueue */
+            if ((_st_kq_data->kq = kqueue()) < 0) {
+                /* There is nothing we can do here, will retry later */
+                return;
+            }
+            fcntl(_st_kq_data->kq, F_SETFD, FD_CLOEXEC);
+            _st_kq_data->pid = getpid();
+            /* Re-register all descriptors on ioq with new kqueue */
+            memset(_st_kq_data->fd_data, 0, _st_kq_data->fd_data_size * sizeof(_kq_fd_data_t));
+            for (q = _st_this_vp.io_q.next; q != &_st_this_vp.io_q; q = q->next) {
+                pq = _ST_POLLQUEUE_PTR(q);
+                _st_kq_pollset_add(pq->pds, pq->npds);
+            }
+            goto retry_kevent;
         }
     }
 }
@@ -505,6 +844,11 @@ ST_HIDDEN int _st_kq_fd_getlimit(void)
     return 0;
 }
 
+ST_HIDDEN void _st_kq_destroy(void)
+{
+    /* TODO: FIXME: Implements it */
+}
+
 static _st_eventsys_t _st_kq_eventsys = {
     "kqueue",
     ST_EVENTSYS_ALT,
@@ -514,7 +858,8 @@ static _st_eventsys_t _st_kq_eventsys = {
     _st_kq_pollset_del,
     _st_kq_fd_new,
     _st_kq_fd_close,  
-    _st_kq_fd_getlimit
+    _st_kq_fd_getlimit,
+    _st_kq_destroy
 };
 #endif  /* MD_HAVE_KQUEUE */
 
@@ -523,7 +868,6 @@ static _st_eventsys_t _st_kq_eventsys = {
 /*****************************************
  * epoll event system
  */
-
 ST_HIDDEN int _st_epoll_init(void)
 {
     int fdlim;
@@ -720,10 +1064,10 @@ ST_HIDDEN void _st_epoll_dispatch(void)
     ++_st_stat_epoll;
     #endif
 
-    if (_ST_SLEEPQ == NULL) {
+    if (_st_this_vp.sleep_q == NULL) {
         timeout = -1;
     } else {
-        min_timeout = (_ST_SLEEPQ->due <= _ST_LAST_CLOCK) ? 0 : (_ST_SLEEPQ->due - _ST_LAST_CLOCK);
+        min_timeout = (_st_this_vp.sleep_q->due <= _st_this_vp.last_clock) ? 0 : (_st_this_vp.sleep_q->due - _st_this_vp.last_clock);
         timeout = (int) (min_timeout / 1000);
 
         // At least wait 1ms when <1ms, to avoid epoll_wait spin loop.
@@ -761,7 +1105,7 @@ ST_HIDDEN void _st_epoll_dispatch(void)
             }
         }
 
-        for (q = _ST_IOQ.next; q != &_ST_IOQ; q = q->next) {
+        for (q = _st_this_vp.io_q.next; q != &_st_this_vp.io_q; q = q->next) {
             pq = _ST_POLLQUEUE_PTR(q);
             notify = 0;
             epds = pq->pds + pq->npds;
@@ -791,7 +1135,7 @@ ST_HIDDEN void _st_epoll_dispatch(void)
                 }
             }
             if (notify) {
-                ST_REMOVE_LINK(&pq->links);
+                st_clist_remove(&pq->links);
                 pq->on_ioq = 0;
                 /*
                  * Here we will only delete/modify descriptors that
@@ -800,9 +1144,9 @@ ST_HIDDEN void _st_epoll_dispatch(void)
                 _st_epoll_pollset_del(pq->pds, pq->npds);
 
                 if (pq->thread->flags & _ST_FL_ON_SLEEPQ)
-                    _ST_DEL_SLEEPQ(pq->thread);
+                    _st_del_sleep_q(pq->thread);
                 pq->thread->state = _ST_ST_RUNNABLE;
-                _ST_ADD_RUNQ(pq->thread);
+                st_clist_insert_before(&pq->thread->links, &_st_this_vp.run_q);
             }
         }
 
@@ -860,6 +1204,17 @@ ST_HIDDEN int _st_epoll_is_supported(void)
     return (errno != ENOSYS);
 }
 
+ST_HIDDEN void _st_epoll_destroy(void)
+{
+    if (_st_epoll_data->epfd >= 0) {
+        close(_st_epoll_data->epfd);
+    }
+    free(_st_epoll_data->fd_data);
+    free(_st_epoll_data->evtlist);
+    free(_st_epoll_data);
+    _st_epoll_data = NULL;
+}
+
 static _st_eventsys_t _st_epoll_eventsys = {
     "epoll",
     ST_EVENTSYS_ALT,
@@ -869,7 +1224,8 @@ static _st_eventsys_t _st_epoll_eventsys = {
     _st_epoll_pollset_del,
     _st_epoll_fd_new,
     _st_epoll_fd_close,
-    _st_epoll_fd_getlimit
+    _st_epoll_fd_getlimit,
+    _st_epoll_destroy
 };
 #endif  /* MD_HAVE_EPOLL */
 
@@ -885,20 +1241,27 @@ int st_set_eventsys(int eventsys)
         return -1;
     }
 
-#if defined (MD_HAVE_KQUEUE)
-    _st_eventsys = &_st_kq_eventsys;
-    return 0;
-#elif defined (MD_HAVE_EPOLL)
-    if (_st_epoll_is_supported()) {
-        _st_eventsys = &_st_epoll_eventsys;
+    if (eventsys == ST_EVENTSYS_SELECT || eventsys == ST_EVENTSYS_DEFAULT) {
+#if defined (MD_HAVE_SELECT)
+        _st_eventsys = &_st_select_eventsys;
         return 0;
+#endif
+    }
+
+    if (eventsys == ST_EVENTSYS_ALT) {
+#if defined (MD_HAVE_KQUEUE)
+        _st_eventsys = &_st_kq_eventsys;
+        return 0;
+#elif defined (MD_HAVE_EPOLL)
+        if (_st_epoll_is_supported()) {
+            _st_eventsys = &_st_epoll_eventsys;
+            return 0;
+        }
+#endif
     }
 
     errno = EINVAL;
     return -1;
-#else
-    #error Only support epoll(for Linux) or kqueue(for Darwin)
-#endif
 }
 
 int st_get_eventsys(void)

@@ -4,7 +4,7 @@ ST_DIR = ..
 # The main dir of st utest.
 ST_UTEST = .
 # The main dir of gtest.
-GTEST_DIR = $(ST_UTEST)/gtest
+GTEST_DIR = $(ST_UTEST)/gtest-fit/googletest
 
 # Flags passed to the C++ compiler.
 CXXFLAGS +=  -g -O0 -std=c++11
@@ -28,7 +28,7 @@ GTEST_SRCS_ = $(GTEST_DIR)/src/*.cc $(GTEST_DIR)/src/*.h $(GTEST_DIR)/include/gt
 # compiles fast and for ordinary users its source rarely changes.
 $(ST_DIR)/obj/gtest-all.o : $(GTEST_SRCS_)
 	$(CXX) -c $(GTEST_DIR)/src/gtest-all.cc -o $@ \
-        $(CXXFLAGS) \
+        $(CXXFLAGS) $(UTEST_FLAGS) \
         $(WARNFLAGS) \
         -I$(GTEST_DIR)/include -I$(GTEST_DIR)
 
@@ -45,16 +45,29 @@ $(ST_DIR)/obj/gtest.a : $(ST_DIR)/obj/gtest-all.o
 ST_UTEST_DEPS = $(ST_DIR)/obj/libst.a
 
 # Depends, utest header files
-UTEST_DEPS = $(ST_UTEST)/st_utest.hpp
+UTEST_DEPS = $(ST_UTEST)/st_utest.hpp Makefile
+
+# Compile all sources files at current directory. For example:
+# 		(st_utest.cpp st_utest_coroutines.cpp st_utest_tcp.cpp)
+SOURCE_FILES = $(shell ls *.cpp)
+#
+# Convert all source files to object files. For example:
+# 		(st_utest.o st_utest_coroutines.o st_utest_tcp.o)
+# https://ftp.gnu.org/old-gnu/Manuals/make-3.79.1/html_chapter/make_8.html
+OBJECTS_FILES = $(patsubst %.cpp,%.o,$(SOURCE_FILES))
+#
+# Prefix object files to objects. For example:
+# 		($(ST_DIR)/obj/st_utest.o $(ST_DIR)/obj/st_utest_coroutines.o $(ST_DIR)/obj/st_utest_tcp.o)
+OBJECTS = $(addprefix $(ST_DIR)/obj/,$(OBJECTS_FILES))
 
 # Objects, build each object of utest
-$(ST_DIR)/obj/st_utest.o : st_utest.cpp $(ST_UTEST_DEPS) $(UTEST_DEPS)
-	$(CXX) -c st_utest.cpp -o $@ \
+$(ST_DIR)/obj/%.o : %.cpp $(ST_UTEST_DEPS) $(UTEST_DEPS)
+	$(CXX) -c $< -o $@ \
         $(CXXFLAGS) $(UTEST_FLAGS) \
         $(WARNFLAGS) \
         -I$(GTEST_DIR)/include -I$(ST_UTEST) -I$(ST_DIR) -I$(ST_DIR)/obj
 
-# generate the utest binary
-$(ST_DIR)/obj/st_utest : $(ST_DIR)/obj/st_utest.o $(ST_DIR)/obj/gtest.a $(ST_UTEST_DEPS)
+# Generate the utest binary
+$(ST_DIR)/obj/st_utest : $(OBJECTS) $(ST_DIR)/obj/gtest.a $(ST_UTEST_DEPS)
 	$(CXX) -o $@ $(CXXFLAGS) $(UTEST_FLAGS) \
         -lpthread -ldl $^

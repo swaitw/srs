@@ -46,6 +46,7 @@ VERSION     = 1.9
 ##########################
 
 CC          = cc
+CXX         = g++
 AR          = ar
 LD          = ld
 RANLIB      = ranlib
@@ -57,6 +58,17 @@ ECHO        = /bin/echo
 
 BUILD       = DBG
 TARGETDIR   = $(OS)_$(shell uname -r)_$(BUILD)
+
+# For Cygwin, it pass a default OS env, we ignore it.
+ifeq ($(OS), Windows_NT)
+OS =
+endif
+
+# For cygwin/windows, the 'uname -r' generate path with parentheses,
+# which cause the make fails, so we use 'uname -s' instead.
+ifeq ($(OS), CYGWIN64)
+TARGETDIR   = $(OS)_$(shell uname -s)_$(BUILD)
+endif
 
 DEFINES     = -D$(OS)
 CFLAGS      =
@@ -73,10 +85,12 @@ DESC        = st.pc
 # Possible targets:
 
 TARGETS     = darwin-debug darwin-optimized         \
-              linux-debug linux-optimized
+              linux-debug linux-optimized           \
+              cygwin64-debug
 
 UTEST_TARGETS = darwin-debug-utest linux-debug-utest \
-                darwin-debug-gcov linux-debug-gcov
+                darwin-debug-gcov linux-debug-gcov   \
+                cygwin64-debug-utest
 
 #
 # Platform specifics
@@ -87,19 +101,30 @@ EXTRA_OBJS  = $(TARGETDIR)/md_darwin.o
 LD          = cc
 SFLAGS      = -fPIC -fno-common
 DSO_SUFFIX  = dylib
-CFLAGS      += -arch x86_64
-LDFLAGS     += -arch x86_64
+CPU_ARCHS 	= $(shell g++ -dM -E - </dev/null |grep -q '__x86_64' && echo x86_64)
+CPU_ARCHS 	+= $(shell g++ -dM -E - </dev/null |grep -q '__aarch64' && echo arm64)
+CFLAGS      += -arch $(CPU_ARCHS)
+LDFLAGS     += -arch $(CPU_ARCHS)
 LDFLAGS     += -dynamiclib -install_name /sw/lib/libst.$(MAJOR).$(DSO_SUFFIX) -compatibility_version $(MAJOR) -current_version $(VERSION)
 OTHER_FLAGS = -Wall
-DEFINES     += -DMD_HAVE_KQUEUE
+DEFINES     += -DMD_HAVE_KQUEUE -DMD_HAVE_SELECT
 endif
 
 ifeq ($(OS), LINUX)
-EXTRA_OBJS  = $(TARGETDIR)/md_linux.o
+EXTRA_OBJS  = $(TARGETDIR)/md_linux.o $(TARGETDIR)/md_linux2.o
 SFLAGS      = -fPIC
 LDFLAGS     = -shared -soname=$(SONAME) -lc
 OTHER_FLAGS = -Wall
-DEFINES     += -DMD_HAVE_EPOLL
+DEFINES     += -DMD_HAVE_EPOLL -DMD_HAVE_SELECT
+endif
+
+ifeq ($(OS), CYGWIN64)
+EXTRA_OBJS  = $(TARGETDIR)/md_cygwin64.o
+SFLAGS      = -fPIC
+DSO_SUFFIX  = dll
+LDFLAGS     = -shared -soname=$(SONAME) -lc
+OTHER_FLAGS = -Wall
+DEFINES     += -DMD_HAVE_SELECT
 endif
 
 #
@@ -159,9 +184,23 @@ endif
 #
 # make EXTRA_CFLAGS=-UMD_HAVE_EPOLL <target>
 #
-# or to enable stats for ST:
+# or to enable sendmmsg(2) support:
+# make EXTRA_CFLAGS="-DMD_HAVE_SENDMMSG -D_GNU_SOURCE"
 #
+# or to enable stats for ST:
 # make EXTRA_CFLAGS=-DDEBUG_STATS
+#
+# or cache the stack and reuse it:
+# make EXTRA_CFLAGS=-DMD_CACHE_STACK
+#
+# or enable support for valgrind:
+# make EXTRA_CFLAGS="-DMD_VALGRIND"
+#
+# or enable support for asan:
+# make EXTRA_CFLAGS="-DMD_ASAN -fsanitize=address -fno-omit-frame-pointer"
+#
+# or to disable the clock_gettime for MacOS before 10.12, see https://github.com/ossrs/srs/issues/3978
+# make EXTRA_CFLAGS=-DMD_OSX_NO_CLOCK_GETTIME
 #
 # or enable the coverage for utest:
 # make UTEST_FLAGS="-fprofile-arcs -ftest-coverage"
@@ -176,7 +215,8 @@ OBJS        = $(TARGETDIR)/sched.o \
               $(TARGETDIR)/sync.o  \
               $(TARGETDIR)/key.o   \
               $(TARGETDIR)/io.o    \
-              $(TARGETDIR)/event.o
+              $(TARGETDIR)/event.o \
+              $(TARGETDIR)/common.o
 OBJS        += $(EXTRA_OBJS)
 HEADER      = $(TARGETDIR)/st.h
 SLIBRARY    = $(TARGETDIR)/libst.a
@@ -239,14 +279,15 @@ $(HEADER): public.h
 	rm -f $@
 	cp public.h $@
 
-$(TARGETDIR)/md_linux.o: md_linux.S
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(TARGETDIR)/md_darwin.o: md_darwin.S
+$(TARGETDIR)/%.o: %.S
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGETDIR)/%.o: %.c common.h md.h
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# Note that we use C++98 standard for the C++ files.
+$(TARGETDIR)/%.o: %.cc common.h md.h
+	$(CXX) $(CFLAGS) -c $< -o $@ -std=c++98
 
 clean:
 	rm -rf *_OPT *_DBG obj st.pc
@@ -277,6 +318,9 @@ linux-debug:
 linux-optimized:
 	$(MAKE) OS="LINUX" BUILD="OPT"
 
+cygwin64-debug:
+	$(MAKE) OS="CYGWIN64" BUILD="DBG"
+
 darwin-debug-utest:
 	@echo "Build utest for state-threads"
 	$(MAKE) OS="DARWIN" BUILD="DBG"
@@ -285,6 +329,10 @@ linux-debug-utest:
 	@echo "Build utest for state-threads"
 	$(MAKE) OS="LINUX" BUILD="DBG"
 	cd utest && $(MAKE)
+cygwin64-debug-utest:
+	@echo "Build utest for state-threads"
+	$(MAKE) OS="CYGWIN64" BUILD="DBG"
+	cd utest && $(MAKE) UTEST_FLAGS="-std=gnu++0x" # @see https://www.codenong.com/18784112/
 
 darwin-debug-gcov:
 	@echo "Build utest with gcov for state-threads"
